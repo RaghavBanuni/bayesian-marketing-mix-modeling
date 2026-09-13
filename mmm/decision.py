@@ -11,7 +11,7 @@ marginal ROAS. Both are computed here, side by side, because the gap is the poin
 **Carryover leaks past the window.** Spend in the last week of the horizon is still selling after the data
 ends. Attributing only the in-window response systematically understates recent, and therefore usually
 growing, channels. ``incremental_contribution`` extends the horizon with zero-spend weeks so the tail is
-counted; the truncation bias is measurable and reported rather than assumed away.
+counted, and reports what fraction of the credit falls outside the window.
 
 **Optimisation must be done at a defined operating point.** Optimising a per-week, per-channel spend matrix
 over two years is a large non-convex problem whose answer nobody can execute. What a planner can execute is
@@ -22,13 +22,12 @@ the allocation problem becomes
     maximise   sum_c beta_c * Hill(s_c; kappa_c, alpha_c)      subject to   sum_c s_c = B,   s_c >= 0.
 
 For ``alpha <= 1`` every channel is concave, the problem is concave, and the optimum equalises marginal
-returns across funded channels -- water-filling by bisection on the Lagrange multiplier. For ``alpha > 1``
-the S-curve toe is convex and the problem is **not** concave: equalising marginal returns can land on a
-local optimum, and the true answer may fund a channel at scale or not at all. That case is handled by
-enumerating which channels are on, solving the concave problem within each subset, and keeping the best;
-with a handful of channels the enumeration is free. ``tests/test_decision.py`` checks the result against a
-brute-force simplex grid search, because an optimiser that quietly returns a local optimum is worse than no
-optimiser at all.
+returns across funded channels -- water-filling by bisection on the shadow price. For ``alpha > 1`` the
+S-curve toe is convex and the problem is **not** concave: equalising marginal returns can land on a local
+optimum, and the true answer may fund a channel at scale or not at all. That case is handled by enumerating
+which channels are on, solving the concave problem within each subset, and keeping the best; with a handful
+of channels the enumeration is free. ``tests/test_decision.py`` checks the result against a brute-force
+simplex grid search, because an optimiser that quietly returns a local optimum is worse than none.
 """
 
 from __future__ import annotations
@@ -54,7 +53,7 @@ class ChannelResult:
     in_window_contribution: float
     roas: float
     marginal_roas: float
-    saturation: float  # fraction of the way to the channel's ceiling at mean spend
+    saturation: float  # how far up its own curve the channel sits at mean active spend
 
     @property
     def tail_share(self) -> float:
@@ -155,7 +154,7 @@ def results_table(results: list[ChannelResult]) -> str:
 
 
 def decomposition(model: MMM, params: Parameters) -> dict[str, float]:
-    """Sales split into baseline and media, as shares. The chart every stakeholder asks for.
+    """Sales split into baseline and media, as shares of observed sales.
 
     The baseline is not "what we would sell with no marketing ever" -- it absorbs brand equity built by
     years of past spend that this window cannot see. It is "what the model cannot attribute to media
@@ -164,9 +163,10 @@ def decomposition(model: MMM, params: Parameters) -> dict[str, float]:
     total = sum(model.data.y)
     if total <= 0.0:
         raise ValueError("total sales must be positive to take shares")
+    contributions = model.channel_contributions(params)
     shares = {"baseline": sum(model.baseline(params)) / total}
     for index, name in enumerate(model.channels):
-        shares[name] = sum(model.channel_contributions(params)[index]) / total
+        shares[name] = sum(contributions[index]) / total
     shares["unexplained"] = 1.0 - sum(shares.values())
     return shares
 
@@ -188,17 +188,17 @@ class Allocation:
     concave: bool
 
     def summary(self) -> str:
-        parts = ", ".join(
-            f"{name} {value:,.0f}" for name, value in sorted(self.spend.items())
-        )
+        parts = ", ".join(f"{name} {value:,.0f}" for name, value in sorted(self.spend.items()))
         marginals = ", ".join(
-            f"{name} {value:.2f}" for name, value in sorted(self.marginal.items()) if self.spend[name] > 0
+            f"{name} {value:.2f}"
+            for name, value in sorted(self.marginal.items())
+            if self.spend[name] > 0
         )
         return (
             f"budget {self.budget:,.0f}/week -> response {self.response:,.0f}/week\n"
             f"  split:     {parts}\n"
             f"  marginal:  {marginals}"
-            + ("" if self.concave else "\n  (S-curve present: allocation chosen by subset enumeration)")
+            + ("" if self.concave else "\n  (S-curve present: funded set chosen by enumeration)")
         )
 
     def shares(self) -> dict[str, float]:
@@ -219,21 +219,21 @@ def _steady_state_marginal(params: Parameters, channel: int, spend: float) -> fl
     return params.beta[channel] * d_u
 
 
-def _spend_for_marginal(
-    params: Parameters, channel: int, price: float, upper: float
-) -> float:
+def _spend_for_marginal(params: Parameters, channel: int, price: float, ceiling: float) -> float:
     """Invert the marginal-return curve on its decreasing branch: find ``s`` with ``beta * ds/du = price``.
 
-    On a concave channel the branch is the whole positive axis. On an S-curve it starts at the inflection
-    point, and below that point the marginal return is *rising*, so a root there is a minimum rather than a
-    maximum -- taking it would be the classic optimiser error on S-curves.
+    On a concave channel that branch is the whole positive axis. On an S-curve it begins at the inflection
+    point; below that point the marginal return is *rising*, so a root there is a minimum rather than a
+    maximum, and taking it is the classic optimiser error on S-curves.
     """
+    if price <= 0.0:
+        return ceiling
     lower = inflection_point(params.half[channel], params.shape[channel]) or 1e-9
     if _steady_state_marginal(params, channel, lower) < price:
         return 0.0  # even at its most productive point the channel cannot pay this price
-    high = max(upper, lower * 2.0)
+    high = max(ceiling, lower * 2.0)
     if _steady_state_marginal(params, channel, high) > price:
-        return high  # still worth more than the price at the budget ceiling
+        return high  # still worth more than the price at the ceiling
     for _ in range(200):
         middle = 0.5 * (lower + high)
         if _steady_state_marginal(params, channel, middle) > price:
@@ -245,36 +245,50 @@ def _spend_for_marginal(
     return 0.5 * (lower + high)
 
 
-def _water_fill(
-    params: Parameters, active: tuple[int, ...], budget: float
+def _total_at_price(
+    params: Parameters, active: tuple[int, ...], price: float, budget: float
 ) -> dict[int, float]:
-    """Equalise marginal returns across the active channels, by bisection on the shadow price."""
+    return {channel: _spend_for_marginal(params, channel, price, budget) for channel in active}
+
+
+def _water_fill(params: Parameters, active: tuple[int, ...], budget: float) -> dict[int, float]:
+    """Equalise marginal returns across the active channels, by bisection on the shadow price.
+
+    The upper bracket is found by doubling rather than guessed from a formula: on an S-curve the largest
+    marginal return sits at the inflection point, not at zero spend, so any closed-form guess based on
+    small-spend behaviour brackets the wrong interval and the bisection converges to a price that
+    overspends.
+    """
     if not active:
         return {}
     low_price = 0.0
-    high_price = max(
-        _steady_state_marginal(params, channel, 1e-6) for channel in active
-    ) + 1.0
-    for _ in range(300):
+    high_price = 1.0
+    for _ in range(200):
+        if sum(_total_at_price(params, active, high_price, budget).values()) <= budget:
+            break
+        high_price *= 2.0
+    else:
+        high_price = float("inf")
+
+    if math.isinf(high_price):
+        # No finite price rations this budget (numerically degenerate parameters); split it evenly.
+        return {channel: budget / len(active) for channel in active}
+
+    for _ in range(200):
         price = 0.5 * (low_price + high_price)
-        allocation = {
-            channel: _spend_for_marginal(params, channel, price, budget) for channel in active
-        }
-        total = sum(allocation.values())
+        total = sum(_total_at_price(params, active, price, budget).values())
         if total > budget:
-            low_price = price  # too much spend: the shadow price must rise
+            low_price = price  # too much spend demanded: the shadow price must rise
         else:
             high_price = price
-        if abs(total - budget) < 1e-7 * max(1.0, budget):
+        if abs(total - budget) < 1e-9 * max(1.0, budget):
             break
-    price = 0.5 * (low_price + high_price)
-    allocation = {
-        channel: _spend_for_marginal(params, channel, price, budget) for channel in active
-    }
+
+    allocation = _total_at_price(params, active, 0.5 * (low_price + high_price), budget)
     total = sum(allocation.values())
     if total > 0.0:
-        # Rescale to exhaust the budget exactly; the bisection converges to within a rounding error and
-        # a plan that does not add up to the budget invites a spreadsheet to "fix" it.
+        # Exhaust the budget exactly: the bisection lands within a rounding error, and a plan that does
+        # not add up to the budget invites a spreadsheet to "fix" it.
         factor = budget / total
         allocation = {channel: value * factor for channel, value in allocation.items()}
     return allocation
@@ -294,9 +308,8 @@ def allocate(model: MMM, params: Parameters, budget: float) -> Allocation:
         raise ValueError("no channels to allocate across")
 
     concave = all(shape <= 1.0 for shape in params.shape)
-    subsets: list[tuple[int, ...]]
     if concave:
-        subsets = [tuple(range(count))]
+        subsets: list[tuple[int, ...]] = [tuple(range(count))]
     else:
         subsets = []
         for size in range(1, count + 1):
@@ -322,7 +335,9 @@ def allocate(model: MMM, params: Parameters, budget: float) -> Allocation:
     for channel, value in best_spend.items():
         spend[model.channels[channel]] = value
     marginal = {
-        model.channels[channel]: _steady_state_marginal(params, channel, spend[model.channels[channel]])
+        model.channels[channel]: _steady_state_marginal(
+            params, channel, spend[model.channels[channel]]
+        )
         for channel in range(count)
     }
     return Allocation(
@@ -371,10 +386,10 @@ def posterior_allocation(
 ) -> dict[str, tuple[float, float, float]]:
     """The recommended split under each posterior draw, reported as (5%, 50%, 95%) shares.
 
-    A single optimal split computed from posterior means is a point estimate of a decision, and it hides
-    the only thing a planner needs to know: whether the recommendation is robust. If the credible interval
-    for a channel's share runs from 5% to 40%, the honest recommendation is "we cannot tell yet, and here
-    is the experiment that would settle it".
+    A single split computed from posterior means is a point estimate of a decision, and it hides the only
+    thing a planner needs to know: whether the recommendation is robust. If the credible interval for a
+    channel's share runs from 5% to 40%, the honest recommendation is "we cannot tell yet, and here is the
+    experiment that would settle it".
     """
     from .diagnostics import quantile
 
