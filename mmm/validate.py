@@ -88,9 +88,7 @@ def _standard_deviation(values: list[float]) -> float:
 def _lag_one_autocorrelation(values: list[float]) -> float:
     count = len(values)
     average = sum(values) / count
-    numerator = sum(
-        (values[t] - average) * (values[t + 1] - average) for t in range(count - 1)
-    )
+    numerator = sum((values[t] - average) * (values[t + 1] - average) for t in range(count - 1))
     denominator = sum((value - average) ** 2 for value in values)
     return numerator / denominator if denominator > 0 else 0.0
 
@@ -195,9 +193,7 @@ def parameter_recovery(model: MMM, posterior, truth: Parameters) -> list[Recover
 
 
 def recovery_table(results: list[RecoveryResult]) -> str:
-    header = (
-        f"{'parameter':<22}{'truth':>14}{'posterior':>14}{'5%':>13}{'95%':>13}{'in':>7}"
-    )
+    header = f"{'parameter':<22}{'truth':>14}{'posterior':>14}{'5%':>13}{'95%':>13}{'in':>7}"
     lines = [header, "-" * len(header)]
     lines.extend(result.row() for result in results)
     covered = sum(1 for result in results if result.covered)
@@ -246,9 +242,9 @@ def forecast_evaluation(
 ) -> Forecast:
     """Score a posterior fitted on the training weeks against the held-out tail.
 
-    ``model_full`` must be a model built on the **whole** dataset while ``posterior`` was fitted on the
-    training部分 only, so that the mean function can be evaluated over the full horizon -- carryover from
-    the training weeks into the holdout is then handled correctly instead of being reset to zero.
+    ``model_full`` must be built on the **whole** dataset while ``posterior`` was fitted on the training
+    weeks alone. Evaluating the mean function over the full horizon is what makes carryover from the
+    training weeks flow correctly into the holdout instead of being reset to zero at the boundary.
     """
     if holdout < 1:
         raise ValueError("holdout must be at least one week")
@@ -279,9 +275,7 @@ def forecast_evaluation(
         errors.append((observed - centre) ** 2)
         if observed != 0.0:
             percentage.append(abs(observed - centre) / abs(observed))
-        low = quantile(column, 0.05)
-        high = quantile(column, 0.95)
-        if low <= observed <= high:
+        if quantile(column, 0.05) <= observed <= quantile(column, 0.95):
             inside += 1
 
     # The benchmark is last year's same week where possible, otherwise the training mean: a forecast that
@@ -293,9 +287,7 @@ def forecast_evaluation(
     for offset in range(holdout):
         index = weeks - holdout + offset - period
         naive.append(model_full.data.y[index] if index >= 0 else training_mean)
-    naive_errors = [
-        (observed - reference) ** 2 for observed, reference in zip(actual, naive)
-    ]
+    naive_errors = [(observed - reference) ** 2 for observed, reference in zip(actual, naive)]
 
     return Forecast(
         weeks=holdout,
@@ -307,7 +299,7 @@ def forecast_evaluation(
 
 
 def train_test_split(data: Dataset, holdout: int) -> tuple[Dataset, Dataset]:
-    """Chronological split. Never random: shuffling time series leaks the future into the past."""
+    """Chronological split. Never random: shuffling a time series leaks the future into the past."""
     if holdout < 1 or holdout >= data.weeks:
         raise ValueError("holdout must be between 1 and weeks - 1")
     return data.slice(0, data.weeks - holdout), data.slice(data.weeks - holdout, data.weeks)
